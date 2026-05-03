@@ -1,27 +1,23 @@
 import os
-import numpy as np
+import chromadb
 import dashscope
-from dashscope import TextEmbedding, Generation
+from dashscope import Generation
 from dotenv import load_dotenv
 
-# 加载配置
+# ===================== 0. 加载配置 =====================
 load_dotenv()
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
+CHROMA_PATH = "./chroma_db"  # Chroma 持久化存储路径
+COLLECTION_NAME = "rag_knowledge"  # 集合名称
 
-# ===================== 1. 加载本地文档 =====================
+# ===================== 1. 复用文档分块代码（Day12） =====================
 def load_document(file_path: str) -> str:
     """读取本地 .md/.txt 文档"""
     with open(file_path, 'r', encoding='utf-8') as f:
         return f.read()
 
-# ===================== 2. 文本分块（按固定字数） =====================
 def split_text(text: str, chunk_size: int = 300) -> list:
-    """
-    按固定长度做文本分块
-    :param text: 原始文档文本
-    :param chunk_size: 每块的字数
-    :return: 分块后的文本列表
-    """
+    """按固定长度做文本分块"""
     chunks = []
     for i in range(0, len(text), chunk_size):
         chunk = text[i:i+chunk_size].strip()
@@ -29,60 +25,65 @@ def split_text(text: str, chunk_size: int = 300) -> list:
             chunks.append(chunk)
     return chunks
 
-# ===================== 3. 生成向量（通义千问Embedding API） =====================
-def get_embeddings(texts: list) -> list:
+# ===================== 2. 封装 Chroma 核心函数（代码结构优化） =====================
+def init_chroma() -> chromadb.Collection:
     """
-    批量生成文本向量
-    :param texts: 文本列表（分块后的文档/用户问题）
-    :return: 向量列表
+    【函数1】初始化 Chroma 向量库
+    :return: 集合对象（专属货架）
     """
-    resp = TextEmbedding.call(
-        model=TextEmbedding.Models.text_embedding_v2,
-        input=texts
-    )
-    return [item['embedding'] for item in resp.output['embeddings']]
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    # 有就拿，没有就建，安全不报错
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    return collection
 
-# ===================== 4. 向量相似度检索（余弦相似度） =====================
-def cosine_similarity(vec1: list, vec2: list) -> float:
-    """计算两个向量的余弦相似度"""
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-
-def retrieve_top_k(query_embedding: list, chunk_embeddings: list, chunks: list, top_k: int = 3) -> list:
+def add_docs_to_chroma(collection: chromadb.Collection, chunks: list):
     """
-    检索最相关的 TOP-K 个文档块
-    :param query_embedding: 用户问题的向量
-    :param chunk_embeddings: 所有文档分块的向量
+    【函数2】批量将分块文本存入 Chroma（自动去重，避免重复上传）
+    :param collection: Chroma 集合对象
     :param chunks: 分块后的文本列表
-    :param top_k: 返回最相关的块数
-    :return: TOP-K 相关文档块
     """
-    similarities = [cosine_similarity(query_embedding, ce) for ce in chunk_embeddings]
-    top_indices = np.argsort(similarities)[-top_k:][::-1]  # 取相似度最高的top_k个
-    return [chunks[i] for i in top_indices]
+    # 检查是否已经入库过，避免重复添加
+    if collection.count() > 0:
+        print("✅ 文档已在 Chroma 库中，跳过重复入库")
+        return
+    
+    # 生成唯一ID（用索引作为ID）
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
+    
+    # 批量入库（Chroma 自动生成向量）
+    collection.add(
+        documents=chunks,
+        ids=ids
+    )
+    print(f"✅ 文档分块已存入 Chroma，共 {len(chunks)} 块")
 
-# ===================== 5. RAG 问答整合（核心） =====================
-def rag_qa(
-    query: str,
-    chunks: list,
-    chunk_embeddings: list,
-    top_k: int = 3
-) -> str:
+def search_chroma(collection: chromadb.Collection, query: str, top_k: int = 3) -> list:
     """
-    RAG 完整问答流程
+    【函数3】语义相似度检索，返回最相关的 TOP-K 文档片段
+    :param collection: Chroma 集合对象
     :param query: 用户问题
-    :param chunks: 分块后的文档列表
-    :param chunk_embeddings: 文档分块的向量
-    :param top_k: 检索的块数
+    :param top_k: 返回条数
+    :return: 相关文档片段列表
+    """
+    results = collection.query(
+        query_texts=query,
+        n_results=top_k
+    )
+    return results['documents'][0]
+
+# ===================== 3. RAG 问答整合（对接 Chroma 检索结果） =====================
+def rag_qa_chroma(collection: chromadb.Collection, query: str) -> str:
+    """
+    基于 Chroma 的 RAG 完整问答
+    :param collection: Chroma 集合对象
+    :param query: 用户问题
     :return: 大模型回答
     """
-    # 5.1 生成问题向量
-    query_embedding = get_embeddings([query])[0]
-    
-    # 5.2 检索最相关的文档块
-    relevant_chunks = retrieve_top_k(query_embedding, chunk_embeddings, chunks, top_k)
-    
-    # 5.3 拼接提示词（检索增强 + 防幻觉约束）
+    # 3.1 检索最相关的文档片段
+    relevant_chunks = search_chroma(collection, query, top_k=3)
     context = "\n".join(relevant_chunks)
+    
+    # 3.2 拼接提示词（检索增强 + 防幻觉约束）
     system_prompt = f"""
     你是专业的知识库问答助手。
     【核心约束】
@@ -94,44 +95,46 @@ def rag_qa(
     {context}
     """
     
-    # 5.4 调用大模型生成回答
+    # 3.3 调用大模型生成回答
     response = Generation.call(
         model="qwen-turbo",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": query}
         ],
-        temperature=0.1,  # 低温度=精准
+        temperature=0.1,
         max_tokens=1024,
         result_format="message"
     )
     return response.output.choices[0].message.content
 
-# ===================== 测试验证（必做） =====================
+# ===================== 4. 测试验证（必做） =====================
 if __name__ == '__main__':
-    # 1. 加载并处理文档
+    # 4.1 初始化 Chroma
     print("="*60)
-    print("【1/4】加载本地文档...")
+    print("【1/4】初始化 Chroma 向量库...")
+    collection = init_chroma()
+    
+    # 4.2 加载并分块文档（仅第一次运行会入库，后续跳过）
+    print("\n【2/4】加载并分块本地文档...")
     doc_text = load_document("knowledge.md")
-    print(f"文档加载完成，总字数：{len(doc_text)}")
-    
-    print("\n【2/4】文本分块...")
     chunks = split_text(doc_text, chunk_size=300)
-    print(f"分块完成，共 {len(chunks)} 块")
+    add_docs_to_chroma(collection, chunks)
     
-    print("\n【3/4】生成文档向量...")
-    chunk_embeddings = get_embeddings(chunks)
-    print(f"向量生成完成，共 {len(chunk_embeddings)} 个向量")
-    
-    print("\n【4/4】RAG 问答测试...")
+    # 4.3 测试专业问题（验证检索精准度）
+    print("\n【3/4】RAG 问答测试...")
     print("="*60)
     
-    # 测试1：问文档里的专属内容（应该准确回答）
+    # 测试1：文档内专业问题
     test_q1 = "RAG的核心作用是什么？"
     print(f"\n问题1（文档内）：{test_q1}")
-    print(f"回答：{rag_qa(test_q1, chunks, chunk_embeddings)}")
+    print(f"回答：{rag_qa_chroma(collection, test_q1)}")
     
-    # 测试2：问文档外的内容（应该说不知道）
+    # 测试2：文档外问题（防幻觉）
     test_q2 = "2026年火星世界杯冠军是谁？"
     print(f"\n问题2（文档外）：{test_q2}")
-    print(f"回答：{rag_qa(test_q2, chunks, chunk_embeddings)}")
+    print(f"回答：{rag_qa_chroma(collection, test_q2)}")
+    
+    # 4.4 持久化验证提示
+    print("\n" + "="*60)
+    print("💡 持久化验证：现在关闭程序，重新运行，直接提问仍能检索到内容！")
